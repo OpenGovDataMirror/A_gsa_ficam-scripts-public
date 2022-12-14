@@ -1,0 +1,374 @@
+<#
+    .SYNOPSIS
+    Add or Remove AltSecID to AD based upon end-user certificates in a directory
+    .DESCRIPTION
+    Add or Remove AltSecID to AD based upon end-user certificates in a directory
+    .PARAMETER Add
+    Mandatory instead of Remove or Check.  Configures the Script to Remove AltSecIDs in AD 
+    .PARAMETER Remove
+    Mandatory instead of Add or Check.  Configures the Script to Remove AltSecIDs in AD 
+    .PARAMETER Check
+    Mandatory instead of Add or Remove.  Configures the Script to search ALL of AD for accounts without AltSecID set and outputs to a CSV File. 
+    .PARAMETER certDir
+    The Location of your Certificates Directory.  Should contain .CER file
+    .PARAMETER Log
+    Enables Logging within the Script
+    .PARAMETER Admin
+    Enables the script to check if user accounts on certificates also have a coorisponding Admin account with a designated prefix or suffix  For example -Admin "suffix:.adm" or -Admin "prefix:adm." This will change the associated username from the cert to have the assocaited suffix or prefix appended. 
+    .PARAMETER Schedule
+    Enables the script to run as a scheduled task where it will delete the coorisponding certificate in the CertDir after adding/removing
+    .PARAMETER -WhatIf
+    Puts script in full Read/Write mode and will not perform any change activity including writing the log.  Will only output to the console the expected results.
+    .EXAMPLE
+    mapbyCert-directory.ps1 -Add -certDir C:\UserCerts -Log
+    .EXAMPLE
+    mapbyCert-directory.ps1 -Check -Log
+    .EXAMPLE
+    mapbyCert-directory.ps1 -Remove -certDir C:\UserCerts
+    .EXAMPLE
+    mapbyCert-directory.ps1 -Add -certDir C:\UserCerts -Schedule -Admin "suffix:.adm"
+    .LINK
+    https://playbooks.idmanagement.gov/piv/network/account/
+    .NOTES
+    Logging is not required but even with logging disabled, the script will output to the screen
+#>
+
+[CmdletBinding(DefaultParameterSetName='Add', SupportsShouldProcess=$true)] #this puts the default mode of the script into ADD mode, may want to consider switching it to Check mode
+Param(
+    [Parameter(ParameterSetName='Add')]
+    [switch]$Add,
+    [Parameter(ParameterSetName='Remove')]
+    [switch]$Remove,
+    [Parameter(ParameterSetName='Check')]
+    [switch]$Check,
+
+    [Parameter(Mandatory=$true,ParameterSetName='Add')]
+    [Parameter(Mandatory=$true,ParameterSetName='Remove')][ValidateScript({
+    #check if folder path is valid
+    if((Get-ChildItem $_ -Recurse -Include *.cer | Measure-Object).Count -eq 0){
+        throw "Folder Path is empty or does not contain .CER files, please enter folder path that contains certificate files"
+        }
+        return $true 
+    })][System.IO.FileInfo]$certDir,
+    
+    [Parameter(Mandatory=$false,ParameterSetName='Add')]
+    [Parameter(Mandatory=$false,ParameterSetName='Remove')]
+    [switch]$Schedule=$false,
+
+    [Parameter(Mandatory=$false,ParameterSetName='Add')]
+    [Parameter(Mandatory=$false,ParameterSetName='Remove')]
+    [Parameter(Mandatory=$false,ParameterSetName='Check')]
+    [switch]$Log=$false,
+
+    [Parameter(Mandatory=$false,ParameterSetName='Add')]
+    [Parameter(Mandatory=$false,ParameterSetName='Remove')]
+    [Parameter(Mandatory=$false,ParameterSetName='Check')][ValidateScript({
+    #Check if correct suffix or prefix was entered properly
+    $type,$addition = $_.split(':')
+    if (![string]::IsNullOrEmpty($addition)){
+    switch ($type){
+        suffix { return $true}
+        prefix { return $true}
+        default{throw "Improper Syntax for Admin Parameter"}
+        }}
+    else {throw "Improper Syntax for Admin Parameter"}
+    })][string]$Admin=$null
+     
+)
+
+
+#Script Helper Functions begin here
+
+function Write-Log
+{
+    [CmdletBinding()]
+    param
+    (
+        [String]$Message,
+        [String]$Warning,
+        [System.Management.Automation.ErrorRecord]$ErrorObj,
+        [String]$LogFolderPath = "$PSScriptRoot\Logs",
+        [String]$LogFilePrefix = 'Log'
+    )
+ 
+    $Date = Get-Date -Format "dd_MMMM_yyyy"
+    $Time = Get-Date -Format "HH:mm:ss.f"
+    $LogFile = "$LogFolderPath\$LogFilePrefix`_$Date.log"
+ 
+    if (-not (Test-Path -Path $LogFolderPath))
+    {
+        [Void](New-Item -ItemType Directory -Path $LogFolderPath -Force)
+    }
+ 
+    if (-not (Test-Path -Path $LogFile))
+    {
+        [Void](New-Item -ItemType File -Path $LogFile -Force)
+    }
+ 
+    $LogMessage = "[$Time] "
+ 
+    if ($PSBoundParameters.ContainsKey("ErrorObj"))
+    {
+        $LogMessage += "Error: $ErrorObj $($ErrorObj.ScriptStackTrace.Split("`n") -join ' <-- ')"
+        Write-Error -Message $LogMessage
+    }
+    elseif ($PSBoundParameters.ContainsKey("Warning"))
+    {
+        $LogMessage += "Warning: $Warning"
+        Write-Warning -Message $LogMessage
+    }
+    else
+    {
+        $LogMessage += "Info: $Message"
+        Write-Verbose -Message $LogMessage
+    }
+ 
+    Add-Content -Path $LogFile -Value "$LogMessage"
+}
+
+
+function RemoveAltSecIDs($userAccount) {
+#This function will remove AltSecIDs from the User Account
+    try{
+        set-aduser -identity $userAccount -Clear altsecurityidentities
+        if ($Log){Write-Log -Message "Removed altSecurityIdentities attribute for user $userAccount"}
+        Write-Host "Removed altSecurityIdentities attribute for user $userAccount." -ForegroundColor Green
+    }
+    catch{
+        if ($Log){Write-Log -ErrorObj $_}
+        else{Write-Error "Failed to remove AltSecID for $userAccount $($_.Exception.Message)"}
+    }
+
+}
+
+function AddAltSecIDs($userAccount) {
+#This function will ADD AltSecIDs from the User Account
+    try{
+        set-aduser -identity $userAccount -Replace @{'altsecurityidentities'=$newcert}
+        if ($Log){Write-Log -Message "Added altSecurityIdentities attribute for user $userAccount."}
+        Write-Host "Added altSecurityIdentities attribute for user $userAccount." -ForegroundColor Green
+    }
+    catch{
+        if ($Log){Write-Log -ErrorObj $_}
+        else{Write-Error "Failed to add AltSecID for $userAccount $($_.Exception.Message)"}
+    }
+
+}
+
+function GetCertificateSAN ($certificate){
+
+        #Extract UPN from Certificate  
+	    $comOBJS = @()
+	    $Extensions=$certificate.Extensions | Where-Object {$_.Oid.FriendlyName -eq "Subject Alternative Name"}
+        
+        #check if SAN Exists.  If it does not exist, display readable message and move on to next certificate
+        if ($Extensions -eq $null){
+            if ($Log){Write-Log -Warning "No Subject Alternative Name exists in the certificate file $cert"}
+            else {Write-Warning "No Subject Alternative Name exists in the certificate file $cert"}
+            continue
+        }
+          
+        #Extract the UPN removing the @ symbol       	 
+	    $comOBJS += new-object -ComObject X509Enrollment.CX509ExtensionAlternativeNames       	 
+	    $UPNString=[System.Convert]::ToBase64String($Extensions.RawData)       	 
+	    $comObjs[0].InitializeDecode(1, $UPNString)       	 
+	    $upn = ($comOBJS[0].AlternativeNames | ?{$_.StrValue -like "*@*"}  ).strvalue
+
+        #Remove the domain from the UPN - such that it matches the logon account ID
+	    return $upn.split('@')[0].split(',')[0]
+}
+
+function SearchADforUser ($upnID){
+        #Determine if UPN matches a user account
+        try {
+            Get-ADUser -Identity $upnID | Out-Null
+        }
+
+        catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException]{
+            if ($Log){Write-Log -Warning "User $upnID observed in $cert does not exist."}
+            else {Write-Warning "User $upnID observed in $cert does not exist."}
+            return $false
+        }
+
+        return $true
+
+}
+
+function FormatAltSecID ($certificate){
+
+            #We need to Reverse the AltID from Cert so it is formated for AD
+            #Formulate Subject/Issuer String (reversed as we view it)
+		        $paths = [Regex]::Replace($certificate.Issuer, ',\s*(CN=|OU=|O=|C=|DC=)', '!$1') -split "!"
+
+		        $issuer = ""
+		        #Reverse the path and save as $issuer
+			        for ($i = $paths.count -1; $i -ge 0; $i--) 
+			        {
+				        $issuer += $paths[$i]
+				        if ($i -ne 0) 
+				        {
+					        $issuer += ","
+				        }
+			        }
+
+		        $paths = [Regex]::Replace($certificate.subject, ',\s*(CN=|SERIALNUMBER=|dnQualifier=|OU=|O=|C=|DC)', '!$1') -split "!"
+
+		        $subject = ""
+		        #Reverse the path and save as $subject
+			        for ($i = $paths.count -1; $i -ge 0; $i--) 
+			        {
+				        $subject += $paths[$i]
+				        if ($i -ne 0) 
+				        {
+					        $subject += ","
+				        }
+			        }
+
+		        #Get rid of the extra + sign that Microsoft adds in (not sure why)
+		        $subject = $subject.Replace("+ ", "")
+
+		        #Format as needed for altSecurityIdentities attribute
+		        Return "X509:<I>$issuer<S>$subject"
+}
+
+function GetAdminUsername ($orgUPN){
+#This will split the suffix/prefix from the Admin string and return the new UPN to the environment
+    $type,$addition = $Admin.split(':')
+    switch ($type){
+        suffix { return $orgUPN+$addition}
+        prefix { return $addition+$orgUPN}
+        }
+
+}
+
+function RemoveCertificateFile ($targetCert){
+#This function will remove the target certificate file from the computer
+    try{
+        Remove-Item $targetCert -ErrorAction Stop #Not using -Force to protect Read-Only files
+        if ($Log){Write-Log -Message "Removed certificate file $targetCert"}
+        Write-Host "Removed certificate file $targetCert" -ForegroundColor Green
+    }
+    catch{
+        if ($Log){Write-Log -ErrorObj $_}
+        else{Write-Error "Failed to remove certificate file $targetCert $($_.Exception.Message)"}
+
+    }
+    
+}
+
+#Main Script Process Begins Here
+
+#Do some basic logging to show the script is starting with which mode the script is running in.
+
+    if($PSBoundParameters.ContainsKey("Add")){
+        if ($Log){Write-Log -Message "Script is starting a new session in Add Mode"}
+        Write-Host "Script is starting a new session in Add Mode"
+        }
+    elseif ($PSBoundParameters.ContainsKey("Check")){
+        if ($Log){Write-Log -Message "Script is starting a new session in Check Mode"}
+        Write-Host "Script is starting a new session in Check Mode"
+        }
+    elseif($PSBoundParameters.ContainsKey("Remove")){
+        if ($Log){Write-Log -Message "Script is starting a new session in Remove Mode"}
+        Write-Host "Script is starting a new session in Remove Mode"
+        }
+    else{
+        if ($Log){Write-Log -Warning "Script is running without Add, Remove, Check, Please Specify Add/Remove/Check mode, Script will now exit"}
+        Write-Error "Script is running without Add, Remove, Check, Please Specify Add/Remove/Check mode, Script will now exit"
+        #Since script is not running with Add/Remove/Check we need to terminate
+        Exit 1
+        }
+
+#Import Required Powershell Modules or fail if you cannot import them
+Try{
+    Write-host "Importing modules…" –NoNewline
+    if ($PSBoundParameters.ContainsKey("Log")){Write-Log -Message "Importing modules..."}
+    
+        Import-Module ActiveDirectory –ErrorAction Stop
+
+    Write-host "Success" –ForegroundColor Green
+    if ($PSBoundParameters.ContainsKey("Log")){Write-Log -Message "Success"} 
+    }
+    Catch
+    {
+        Write-host "$($_.Exception.Message)" –ForegroundColor Red
+        if ($PSBoundParameters.ContainsKey("Log")){Write-Log -ErrorObj $_}
+        Return
+    }
+
+#Check if Script is in Add or Remove Mode then proceed accordingly
+if (($PSBoundParameters.ContainsKey("Add")) -or ($PSBoundParameters.ContainsKey("Remove")))
+{
+
+    # Defines location of certificates
+    $certList = Get-ChildItem $certDir -Recurse -Include *.cer #Get all CER files in the directory to prevent early script failure
+
+    Write-Host "Enumerating certificate files within $certDir`:"
+    if ($PSBoundParameters.ContainsKey("Log")){Write-Log -Message "Enumerating certificate files within $certDir"}
+
+    foreach ($cert in $certList) 
+    {
+
+        #Gets basic information from the certificate
+        #Load Certificate from file
+        $certPrint = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
+        $certPrint.Import($cert)
+        
+        #Get the UPN name from the Certificate
+        $upnsplit=GetCertificateSAN($certPrint)
+
+        #Check if Admin Mode Enabled, If so, we need to modify the UPN to contain the prefix or suffix
+        if(![string]::IsNullOrEmpty($admin)){
+            #Admin mode is enabled or was specified
+            $upnsplit=GetAdminUsername($upnsplit)
+        }
+
+        #Check if User Exists in AD
+        $UserExists = SearchADforUser($upnsplit)
+
+        #Check if we are removing the AltSecID
+        if ($PSBoundParameters.ContainsKey("Remove") -and $UserExists)
+        {
+            #Desired Function is to remove the AltSecID from the UPN
+            if($PSCmdlet.ShouldProcess($upnsplit,"Remove AltsecID")){
+            RemoveAltSecIDs($upnsplit)
+            }
+        }
+
+        #Check if we are adding the AltSecID
+        elseif ($PSBoundParameters.ContainsKey("Add") -and $UserExists)
+        {
+             #Desired Function is to add the Cert to the AltSecID from the UPN
+             $newcert=FormatAltSecID($certPrint)
+
+		     #Set the AD user record with the AltSecID attribute
+             if($PSCmdlet.ShouldProcess($upnsplit,"Add AltsecID")){
+             AddAltSecIDs($upnSplit)
+             }
+        }
+
+        #Check if Schedule is set so we should remove the certificate file
+        if ($PSBoundParameters.ContainsKey("Schedule"))
+        {
+            #The Schedule Option is set and therefore we should remove the cert file
+            if($PSCmdlet.ShouldProcess($cert,"Removing Certificate File")){
+                RemoveCertificateFile($cert)
+             }
+
+        }
+        
+    }
+}
+
+#Verify script is in Check Mode
+elseif ($PSBoundParameters.ContainsKey("Check"))
+{
+#Print any AD user records that do not contain an AltSecID attribute
+
+Write-Host "The following users are missing an altSecurityIdentities attribute:"
+if ($PSBoundParameters.ContainsKey("Log")){Write-Log -Message "The following users are missing an altSecurityIdentities attribute:"}
+$missingAltSecUsers= get-aduser -filter * -properties altsecurityidentities,samaccountname | where {!$_.altsecurityidentities} | select-object samaccountname
+$missingAltSecUsers
+if ($PSBoundParameters.ContainsKey("Log")){foreach ($missingUsers in $missingAltSecUsers){Write-Log -Message $missingUsers.samaccountname}}
+
+}
